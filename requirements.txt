@@ -1,0 +1,2 @@
+# Локальная установка с GPU (Linux / WSL). Для CPU: pip install -r requirements-cpu.txt
+-r requirements-gpu.txt

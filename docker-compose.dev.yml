@@ -1,0 +1,32 @@
+# Разработка API без пересборки при правках Python-кода:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# Зависимости (pip) остаются в образе; меняется только код через bind-mount.
+# Пересборка образа нужна только если менялись requirements*.txt или Dockerfile.
+#
+# Фронтенд доступен на http://localhost:8080 (порт 80 сломан в Docker Desktop 29.x на Windows).
+
+services:
+  nginx:
+    ports:
+      - "8080:80"
+
+  api:
+    build:
+      args:
+        ONNX_VARIANT: ${ONNX_VARIANT:-gpu}
+    volumes:
+      - ./app:/app/app
+      - ./data:/app/data
+      - ./pipeline:/app/pipeline
+      - ./src:/app/src
+      - ./schemas.py:/app/schemas.py
+      - ./training_utils.py:/app/training_utils.py
+    command:
+      - uvicorn
+      - src.main:app
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8000"
+      - --reload

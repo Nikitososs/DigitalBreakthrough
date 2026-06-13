@@ -1,0 +1,3 @@
+# Устарело: Nominatim встроен в docker-compose.yml.
+# Используйте:
+#   docker compose up -d --build

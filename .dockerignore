@@ -1,0 +1,42 @@
+# Python / venv
+.env
+.env.*
+!.env.example
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+
+# Git / IDE
+.git/
+.gitignore
+.idea/
+.vscode/
+*.md
+!README.md
+
+# Данные и кэш (монтируются томами)
+cache/
+data/
+dataset/
+
+# Фронтенд (отдельный образ)
+frontend/
+
+# Крупные артефакты модели — монтируются через volume в docker-compose
+fast_rubert/
+model_onnx/
+
+# Прочее
+*.log
+*.xlsx
+*.parquet
+docker-compose*.yml
+Dockerfile*

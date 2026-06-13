@@ -1,0 +1,5 @@
+"""Персистентное хранилище обработанных обращений."""
+
+from app.db.session import get_session, init_db
+
+__all__ = ["get_session", "init_db"]

@@ -1,0 +1,278 @@
+# Корневой .env: DOMAIN, EMAIL, CERTBOT_STAGING (0 — боевой LE, 1 — staging для тестов)
+#
+# Запуск (всё, включая локальный Nominatim):
+#   docker compose up -d --build
+#
+# Первый запуск Nominatim (скачивание PBF + импорт, 30–90 мин):
+#   docker compose up -d nominatim-pbf
+#   docker compose up -d nominatim
+#   docker compose up -d api frontend
+#
+# Первый выпуск сертификата (DOMAIN/EMAIL из .env):
+#   docker compose --profile init-cert run --rm certbot-issue
+#   docker compose restart nginx
+#
+# После renew в фоне:
+#   docker compose exec nginx nginx -s reload
+
+name: zeroproblems
+
+x-gpu: &gpu
+  deploy:
+    resources:
+      reservations:
+        devices:
+          - driver: nvidia
+            count: all
+            capabilities: [gpu]
+
+x-api-env: &api-env
+  PYTHONPATH: /app
+  OLLAMA_HOST: http://ollama:11434
+  OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+  ONNX_DEVICE: ${ONNX_DEVICE:-cuda}
+  DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-zeroproblems}:${POSTGRES_PASSWORD:-zeroproblems}@postgres:5432/${POSTGRES_DB:-zeroproblems}
+  NOMINATIM_URL: ${NOMINATIM_URL:-http://nominatim:8080}
+  NOMINATIM_MIN_INTERVAL_SEC: ${NOMINATIM_MIN_INTERVAL_SEC:-0}
+  NOMINATIM_CONCURRENCY: ${NOMINATIM_CONCURRENCY:-8}
+  GEOCODE_WARMUP_BATCH: ${GEOCODE_WARMUP_BATCH:-80}
+  JWT_SECRET: ${JWT_SECRET:-change-me-to-a-long-random-string}
+  JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-480}
+  ADMIN_USERNAME: ${ADMIN_USERNAME:-admin}
+  ADMIN_PASSWORD: ${ADMIN_PASSWORD:-changeme}
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: zeroproblems-postgres
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-zeroproblems}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-zeroproblems}
+      POSTGRES_DB: ${POSTGRES_DB:-zeroproblems}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: zeroproblems-ollama
+    <<: *gpu
+    ports:
+      - "${OLLAMA_PORT:-11434}:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    restart: unless-stopped
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    container_name: zeroproblems-ollama-pull
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-gemma4:e2b}
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        echo "Pulling Ollama model: $$OLLAMA_MODEL"
+        ollama pull "$$OLLAMA_MODEL"
+    restart: "no"
+
+  nominatim-pbf:
+    image: debian:bookworm-slim
+    container_name: zeroproblems-nominatim-pbf
+    volumes:
+      - nominatim_pbf:/data
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        set -eu
+        OUT="/data/omsk_oblast.osm.pbf"
+        SRC="/data/siberian-fed-district.osm.pbf"
+        URL="https://download.geofabrik.de/russia/siberian-fed-district-latest.osm.pbf"
+        BBOX="70.05,53.35,76.25,57.55"
+        if [ -s "$$OUT" ]; then
+          echo "OK: $$OUT already exists ($$(du -h "$$OUT" | cut -f1))"
+          exit 0
+        fi
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -qq
+        apt-get install -y -qq wget osmium-tool ca-certificates
+        if [ ! -s "$$SRC" ]; then
+          echo "Downloading Siberian Federal District PBF (~550 MB)..."
+          wget -q --show-progress -O "$$SRC" "$$URL"
+        fi
+        echo "Extracting Omsk Oblast (bbox $$BBOX)..."
+        osmium extract -b "$$BBOX" -o "$$OUT" "$$SRC"
+        echo "Done: $$(du -h "$$OUT" | cut -f1)"
+        rm -f "$$SRC"
+    restart: "no"
+
+  nominatim:
+    image: mediagis/nominatim:4.4
+    container_name: zeroproblems-nominatim
+    ports:
+      - "${NOMINATIM_PORT:-8088}:8080"
+    depends_on:
+      nominatim-pbf:
+        condition: service_completed_successfully
+    volumes:
+      - nominatim_data:/var/lib/postgresql/14/main
+      - nominatim_pbf:/nominatim/data
+    environment:
+      PBF_PATH: /nominatim/data/omsk_oblast.osm.pbf
+      IMPORT_WIKIPEDIA: "false"
+      NOMINATIM_PASSWORD: ${NOMINATIM_PASSWORD:-nominatim}
+      THREADS: ${NOMINATIM_THREADS:-2}
+      POSTGRES_SHARED_BUFFERS: ${NOMINATIM_PG_SHARED_BUFFERS:-512MB}
+      POSTGRES_MAINTENANCE_WORK_MEM: ${NOMINATIM_PG_MAINTENANCE_WORK_MEM:-1GB}
+      POSTGRES_EFFECTIVE_CACHE_SIZE: ${NOMINATIM_PG_EFFECTIVE_CACHE_SIZE:-2GB}
+      POSTGRES_WORK_MEM: ${NOMINATIM_PG_WORK_MEM:-32MB}
+    shm_size: 1gb
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 60
+      start_period: 7200s
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        ONNX_VARIANT: ${ONNX_VARIANT:-gpu}
+    container_name: zeroproblems-api
+    <<: *gpu
+    expose:
+      - "8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+      nominatim:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./cache:/app/cache
+      - ./dataset:/app/dataset
+      - ./fast_rubert:/app/fast_rubert
+    environment:
+      <<: *api-env
+      NVIDIA_VISIBLE_DEVICES: ${NVIDIA_VISIBLE_DEVICES:-all}
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/v1/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ""
+    container_name: zeroproblems-frontend
+    expose:
+      - "80"
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+
+  nginx:
+    build:
+      context: ./nginx
+      dockerfile: Dockerfile
+    container_name: zeroproblems-nginx
+    restart: unless-stopped
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    environment:
+      DOMAIN: ${DOMAIN:-}
+    volumes:
+      - certbot_www:/var/www/certbot:ro
+      - certbot_conf:/etc/letsencrypt:ro
+    depends_on:
+      - frontend
+      - api
+
+  certbot:
+    image: certbot/certbot:latest
+    container_name: zeroproblems-certbot
+    restart: unless-stopped
+    depends_on:
+      - nginx
+    volumes:
+      - certbot_www:/var/www/certbot
+      - certbot_conf:/etc/letsencrypt
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        trap exit TERM
+        while true; do
+          certbot renew --webroot -w /var/www/certbot --quiet || true
+          sleep 43200 &
+          wait $$!
+        done
+
+  certbot-issue:
+    image: certbot/certbot:latest
+    profiles:
+      - init-cert
+    volumes:
+      - certbot_www:/var/www/certbot
+      - certbot_conf:/etc/letsencrypt
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in root .env}
+      EMAIL: ${EMAIL:?set EMAIL in root .env}
+      CERTBOT_STAGING: ${CERTBOT_STAGING:-0}
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        set -e
+        STAGING=""
+        if [ "$$CERTBOT_STAGING" = "1" ] || [ "$$CERTBOT_STAGING" = "true" ]; then
+          STAGING="--staging"
+        fi
+        exec certbot certonly --webroot -w /var/www/certbot \
+          -d "$$DOMAIN" \
+          --email "$$EMAIL" \
+          --agree-tos --no-eff-email --non-interactive $$STAGING
+
+volumes:
+  postgres_data:
+  ollama_data:
+  nominatim_pbf:
+  nominatim_data:
+  certbot_www:
+    name: zeroproblems-certbot-www
+  certbot_conf:
+    name: zeroproblems-certbot-conf
